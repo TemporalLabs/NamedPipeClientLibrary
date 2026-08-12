@@ -1,0 +1,16 @@
+bin/
+obj/
+out/
+artifacts/
+publish/
+TestResults/
+.vs/
+.vscode/
+*.user
+*.rsuser
+*.suo
+*.pdb
+*.dll
+*.exe
+*.nupkg
+*.snupkg

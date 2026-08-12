@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- net8.0, no RID: the transport under test is portable BCL, so the same probe binary
+         exercises Windows named pipes and Unix domain sockets on macOS and Linux. -->
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>NamedPipeClientLibrary.Probe</RootNamespace>
+    <AssemblyName>NamedPipeClientLibrary.Probe</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- ProjectReference, deliberately NOT a HintPath to a prebuilt DLL: the probe must always
+         exercise current source, not whatever was last copied somewhere. -->
+    <ProjectReference Include="..\NamedPipeClientLibrary\NamedPipeClientLibrary.csproj" />
+  </ItemGroup>
+
+</Project>
