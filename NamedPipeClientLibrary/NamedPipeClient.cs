@@ -67,6 +67,17 @@ namespace NamedPipeClientLibrary
         private Stream? _stream;
         private Socket? _socket;
 
+        // One frame on the wire at a time. Without this, two callers awaiting SendMessageAsync
+        // concurrently (NotifyTray's location timer and a status request, say) could interleave
+        // their length and body writes. The agent then read the tail of a LocationUpdate --
+        // the bytes 00"} -- as a length of 2,099,392,560 and allocated 2 GB (2026-10-06).
+        private readonly SemaphoreSlim _writeLock = new(1, 1);
+
+        // Ceiling on what the agent may send us, mirroring the agent's own IpcMaxMessageBytes
+        // default. Real traffic is a few KB; this only rejects an out-of-frame stream.
+        private const int MaxMessageBytes = 16 * 1024 * 1024;
+        private const int ReadChunkSize = 64 * 1024;
+
         // 0 = not yet signalled. OnDisconnected used to be raised from up to four places for a
         // single disconnect; this makes it fire exactly once.
         private int _disconnectSignalled;
@@ -200,16 +211,33 @@ namespace NamedPipeClientLibrary
             Stream stream = _stream
                 ?? throw new InvalidOperationException("Not connected. Call ConnectAsync first.");
 
-            var messageBytes = Encoding.UTF8.GetBytes(message);
+            // Length prefix and body in ONE buffer, written once. Explicit little-endian rather
+            // than BitConverter: identical bytes on x64 and ARM64, but it states the wire format.
+            int bodyLength = Encoding.UTF8.GetByteCount(message);
+            var frame = new byte[4 + bodyLength];
+            BinaryPrimitives.WriteInt32LittleEndian(frame, bodyLength);
+            Encoding.UTF8.GetBytes(message, 0, message.Length, frame, 4);
 
-            // Explicit little-endian rather than BitConverter. Identical bytes on x64 and ARM64,
-            // but it states the wire format instead of inheriting it from the host architecture.
-            var lengthBytes = new byte[4];
-            BinaryPrimitives.WriteInt32LittleEndian(lengthBytes, messageBytes.Length);
-
-            await stream.WriteAsync(lengthBytes.AsMemory(0, 4), token);
-            await stream.WriteAsync(messageBytes.AsMemory(0, messageBytes.Length), token);
-            await stream.FlushAsync(token);
+            // Cancelled while waiting: nothing was written, the stream is still in frame.
+            await _writeLock.WaitAsync(token);
+            try
+            {
+                await stream.WriteAsync(frame.AsMemory(), token);
+                await stream.FlushAsync(token);
+            }
+            catch
+            {
+                // A failed or cancelled write may have left part of a frame on the wire, and every
+                // later message would then be mis-read by the agent. Close the connection so the
+                // caller reconnects cleanly instead of writing into a broken stream.
+                try { stream.Dispose(); } catch { }
+                SignalDisconnected();
+                throw;
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
         }
 
         public async Task<string?> ReadMessageAsync(CancellationToken token)
@@ -217,27 +245,38 @@ namespace NamedPipeClientLibrary
             Stream stream = _stream
                 ?? throw new InvalidOperationException("Not connected. Call ConnectAsync first.");
 
+            // A single read may legitimately return fewer than 4 bytes; keep reading.
             byte[] lengthBuffer = new byte[4];
-            int read = await stream.ReadAsync(lengthBuffer.AsMemory(0, 4), token);
-            if (read < 4)
+            int read = 0;
+            while (read < 4)
             {
-                SignalDisconnected();
-                return null;
+                int n = await stream.ReadAsync(lengthBuffer.AsMemory(read, 4 - read), token);
+                if (n == 0)
+                {
+                    SignalDisconnected();
+                    return null;
+                }
+                read += n;
             }
 
             int length = BinaryPrimitives.ReadInt32LittleEndian(lengthBuffer);
-            if (length <= 0)
+            if (length <= 0 || length > MaxMessageBytes)
             {
+                // Out of frame (or absurdly large). There is no way to find the next boundary,
+                // so treat it as a disconnect rather than trusting the number.
+                Console.WriteLine($"[Client Error] Frame claims {length:N0} bytes (limit {MaxMessageBytes:N0}); disconnecting.");
                 SignalDisconnected();
                 return null;
             }
 
-            byte[] buffer = new byte[length];
-            int totalRead = 0;
+            // Grow with the bytes that actually arrive, not with what the header claims.
+            using var body = new MemoryStream(Math.Min(length, ReadChunkSize));
+            byte[] chunk = new byte[Math.Min(length, ReadChunkSize)];
+            int remaining = length;
 
-            while (totalRead < length)
+            while (remaining > 0)
             {
-                int bytesRead = await stream.ReadAsync(buffer.AsMemory(totalRead, length - totalRead), token);
+                int bytesRead = await stream.ReadAsync(chunk.AsMemory(0, Math.Min(remaining, chunk.Length)), token);
                 if (bytesRead == 0)
                 {
                     // Peer closed mid-message. The original fell through and decoded the whole
@@ -247,10 +286,11 @@ namespace NamedPipeClientLibrary
                     return null;
                 }
 
-                totalRead += bytesRead;
+                body.Write(chunk, 0, bytesRead);
+                remaining -= bytesRead;
             }
 
-            return Encoding.UTF8.GetString(buffer, 0, totalRead);
+            return Encoding.UTF8.GetString(body.GetBuffer(), 0, (int)body.Length);
         }
 
         public async Task ListenForMessagesAsync()
